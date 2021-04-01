@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>Cloth Simulation</title>
+		<style>
+			body { margin: 0; }
+		</style>
+	</head>
+	<body>
+        <script src="https://cdn.jsdelivr.net/npm/three@0.126/build/three.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/three@0.126/examples/js/controls/OrbitControls.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/dat.gui@0.7.7/build/dat.gui.min.js"></script>
+        <script>
+			const scene = new THREE.Scene();
+			const camera = new THREE.PerspectiveCamera( 75, window.innerWidth / window.innerHeight, 0.1, 1000 );
+			camera.position.z = 5;
+
+            const clock = new THREE.Clock();
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+            scene.add(directionalLight);
+
+            const ambientLight = new THREE.AmbientLight( 0x404040 ); // soft white light
+            scene.add( ambientLight );
+
+			const renderer = new THREE.WebGLRenderer();
+			renderer.setSize( window.innerWidth, window.innerHeight );
+			document.body.appendChild( renderer.domElement );
+
+            const orbitControls = new THREE.OrbitControls(camera, renderer.domElement);
+			
+            const params = {
+				integration: "ee",
+				windStrength: 0,
+				particleMass: 15, 
+                ks: 10000, 
+                kd: .2,
+                timestep: .001
+			};
+			const integrators = { ExplicitEuler: "ee", SemiImplicitEuler: "sie", Verlet: "v" };
+
+            const gui = new dat.GUI();
+            gui.add( params, 'integration', integrators ).name( 'integrator' );
+            gui.add( params, 'windStrength', 0, 10 ).name( 'wind strength' );
+            gui.add( params, 'particleMass', .1, 25).name( 'mass' );
+            gui.add( params, 'ks', 0, 50000 ).name( 'spring constant' );
+            gui.add( params, 'kd', 0, 10 ).name( 'damping constant' );
+            gui.add( params, 'timestep', 0, .01 ).name( 'timestep' );
+
+            const clothWidth = 15; 
+            const clothHeight = 15; 
+            const clothSize = .2; 
+
+            var vertices = [];
+            var prevVertices = [];
+
+            const centerX = clothHeight * clothSize / 2; 
+            const centerY = clothWidth * clothSize / 2;
+            //create the points/vertices of the cloth
+            var clothGeometry = new THREE.PlaneBufferGeometry((clothWidth-1) * clothSize, (clothHeight-1) * clothSize, clothWidth - 1, clothHeight - 1); 
+            vertices = clothGeometry.getAttribute("position").array;
+            prevVertices = vertices.slice(); 
+
+            const clothMaterial = new THREE.MeshBasicMaterial( { color: 0xff0000, side:THREE.DoubleSide, wireframe:true} );
+            const clothMesh = new THREE.Mesh( clothGeometry, clothMaterial );
+            scene.add(clothMesh);
+
+            const pointsMaterial = new THREE.PointsMaterial( { color: 0x888888, size: 3, blending: THREE.AdditiveBlending, transparent: true, sizeAttenuation: false} );
+            const points = new THREE.Points( clothGeometry, pointsMaterial );
+            scene.add( points );
+
+            var accumulation = 0; 
+            var maxTicks = 3; 
+            
+			const animate = function () {
+				requestAnimationFrame( animate );
+
+
+				renderer.render( scene, camera );
+                var delta = accumulation + clock.getDelta(); 
+                var ticks = Math.min(Math.round(delta / params.timestep), maxTicks); 
+                accumulation = delta - ticks * params.timestep; 
+
+
+                for(var i = 0; i < ticks; i ++) {
+                    var saveVertices = vertices.slice(); 
+
+                    calculateForces(); 
+                    
+                    //no forces on the pinned points
+                    for(var i = 0; i < pins.length; i++) {
+                        forces[pins[i]] = new THREE.Vector3(); 
+                    }
+
+                    switch(params.integration){
+                        case "ee": explicitEulerIntegration(); break;
+                        case "sie": semiImplicitEulerIntegration(); break;
+                        case "v": verletIntegration(); break;
+                    }
+                    prevVertices = saveVertices;
+                }
+
+                clothMesh.geometry.attributes.position.needsUpdate = true;
+			};
+
+
+            //equation of motion from https://graphics.stanford.edu/~mdfisher/cloth.html
+            //each particle has mass 1
+            const m = 1; 
+            //gravity constant 
+            const g = new THREE.Vector3(0, -9.8, 0); 
+
+            var velocities = [];
+            var forces = [];
+
+            var pins = [0, 14]; 
+
+            for(var i = 0; i < clothWidth * clothHeight; i++) {
+                velocities.push(new THREE.Vector3()); 
+                forces.push(new THREE.Vector3()); 
+            }
+
+            function calculateForces() { 
+                for(var row = 0; row < clothHeight; row ++) { 
+                    for(var col = 0; col < clothWidth; col ++) { 
+                        var force = new THREE.Vector3(0, 0, 0); 
+                        //calculate the forces from springs. stretch, shear, bending. 
+                        for(var x = -2; x <= 2; x++) {
+                            for(var y = -2; y <=2; y++) {
+                                if(Math.abs(x) + Math.abs(y) <= 2 && (x != 0 || y != 0))
+                                    force.add(calculateSpringForce(row, col, row + x, col + y)); 
+                            }
+                        }
+                        
+                        //wind force
+                        force.add(calculateWind(row, col)); 
+
+                        //gravity force
+                        force.addScaledVector(g, params.particleMass); 
+
+                        forces[(row * clothWidth + col)] = force; 
+                    }
+                }
+            }
+            
+            function calculateWind(row, col) {
+                var p = new THREE.Vector3(vertices[3 * (row * clothWidth + col)], vertices[3 * (row * clothWidth + col) + 1], vertices[3 * (row * clothWidth + col) + 2]); 
+                var t = clock.elapsedTime; 
+                var wind = new THREE.Vector3(Math.sin(p.x * p.y * t), Math.cos(p.z * t), Math.sin(Math.cos(t*p.x * p.y * p.z))); 
+                wind.multiplyScalar(params.windStrength); 
+                return wind; 
+            }
+
+            function calculateSpringForce(row1, col1, row2, col2) {
+                //quit if the particles are out of bounds or the same particle 
+                if(row1 < 0 || row1 >= clothHeight || col1 < 0 || col1 >= clothWidth || row2 < 0 || row2 >= clothHeight || col2 < 0 || col2 >= clothWidth ) 
+                    return new THREE.Vector3(0, 0, 0); 
+                var p1 = new THREE.Vector3(vertices[3 * (row1 * clothWidth + col1)], vertices[3 * (row1 * clothWidth + col1) + 1], vertices[3 * (row1 * clothWidth + col1) + 2]); 
+                var p2 = new THREE.Vector3(vertices[3 * (row2 * clothWidth + col2)], vertices[3 * (row2 * clothWidth + col2) + 1], vertices[3 * (row2 * clothWidth + col2) + 2]); 
+                
+                var direction = new THREE.Vector3(); 
+                direction.subVectors(p1, p2); 
+                direction.normalize(); 
+
+                //rest length 
+                var l0 = 1;
+                if(Math.abs(row1-row2) == 1 && Math.abs(col1 - col2) == 1) l0 = 1.414;
+                else if(Math.abs(row1-row2) == 2 || Math.abs(col1 - col2) == 2) l0 = 2; 
+
+                l0 = l0 * clothSize; 
+                
+                clothSize * Math.sqrt(Math.pow((row1 - row2), 2) + Math.pow((col1 - col2), 2));
+                
+                var springScalar = params.ks * (p1.distanceTo(p2) - l0); 
+                var velocityDifference = new THREE.Vector3(); 
+                velocityDifference.subVectors(velocities[row1 * clothWidth + col1],velocities[row2 * clothWidth + col2])
+                var dampingScalar = params.kd * velocityDifference.dot(direction); 
+                direction.multiplyScalar(-(springScalar + dampingScalar));
+                return direction;
+            }
+
+            function explicitEulerIntegration() {
+                for(var row = 0; row < clothHeight; row ++) {
+                    for(var col = 0; col < clothWidth; col ++) {
+                        
+                        //update the postion based on velocity * timestep
+                        vertices[3 * (row * clothWidth + col)] +=  params.timestep * velocities[row * clothWidth + col].x; 
+                        vertices[3 * (row * clothWidth + col) + 1] += params.timestep * velocities[row * clothWidth + col].y; 
+                        vertices[3 * (row * clothWidth + col) + 2] += params.timestep * velocities[row * clothWidth + col].z; 
+
+                        //update the velocity based on acceleration * timestep 
+                        velocities[row * clothWidth + col].addScaledVector(forces[row * clothWidth + col], params.timestep);
+
+                    }
+                }
+            }
+            function semiImplicitEulerIntegration() {
+                for(var row = 0; row < clothHeight; row ++) {
+                    for(var col = 0; col < clothWidth; col ++) {
+                        //update the velocity based on acceleration * timestep 
+                        velocities[row * clothWidth + col].addScaledVector(forces[row * clothWidth + col], params.timestep);
+                        
+                        //update the postion based on velocity * timestep
+                        vertices[3 * (row * clothWidth + col)] +=  params.timestep * velocities[row * clothWidth + col].x; 
+                        vertices[3 * (row * clothWidth + col) + 1] += params.timestep * velocities[row * clothWidth + col].y; 
+                        vertices[3 * (row * clothWidth + col) + 2] += params.timestep * velocities[row * clothWidth + col].z; 
+                    }
+                }
+            }
+
+            function verletIntegration() {
+                for(var row = 0; row < clothHeight; row ++) {
+                    for(var col = 0; col < clothWidth; col ++) {
+                        
+                        var p = new THREE.Vector3(vertices[3 * (row * clothWidth + col)], vertices[3 * (row * clothWidth + col) + 1], vertices[3 * (row * clothWidth + col) + 2]); 
+                        var prevP = new THREE.Vector3(prevVertices[3 * (row * clothWidth + col)], prevVertices[3 * (row * clothWidth + col) + 1], prevVertices[3 * (row * clothWidth + col) + 2]); 
+
+                        var newP = new THREE.Vector3(); 
+                        newP.addScaledVector(p, 2.0); 
+                        newP.sub(prevP); 
+                        newP.addScaledVector(forces[row * clothWidth + col], params.timestep * params.timestep); 
+
+                        vertices[3 * (row * clothWidth + col)] =  newP.x; 
+                        vertices[3 * (row * clothWidth + col) + 1] = newP.y; 
+                        vertices[3 * (row * clothWidth + col) + 2] = newP.z; 
+
+
+                    }
+                }
+            }
+            function rk4Integration() {
+                //TO DO 
+            }   
+            function resetSimulation() {
+                for(var row = 0; row < clothHeight; row ++) {
+                    for(var col = 0; col < clothWidth; col ++) {
+                        vertices[3 * (row * clothWidth + col)] = col * clothSize - clothSize * (clothWidth - 1) * .5; 
+                        vertices[3 * (row * clothWidth + col) + 1] = clothSize * (clothHeight-1) - row * clothSize - clothSize * (clothHeight-1) * .5; 
+                        vertices[3 * (row * clothWidth + col) + 2] = 0; 
+
+                        forces[row * clothWidth + col] = new THREE.Vector3(); 
+                        velocities[row * clothWidth + col] = new THREE.Vector3(); 
+                    }
+                }
+                prevVertices = vertices.slice(); 
+
+                                    
+            }
+            document.body.onkeydown = function(e){
+                if(e.keyCode == 32){
+                    resetSimulation();
+                }
+            }
+
+
+            // calculateForces();
+			animate();
+		</script>
+	</body>
+</html>
